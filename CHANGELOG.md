@@ -1,8 +1,23 @@
 # Changelog
 
 All notable changes to syncdot (called dotsync up to 0.8.0) are documented here. Versions follow
-[Semantic Versioning](https://semver.org/); while on 0.x, minor releases may
-include breaking changes.
+[Semantic Versioning](https://semver.org/): from 1.0.0 on, breaking changes
+only come with a new major version. (On 0.x, minor releases could include
+breaking changes.)
+
+## [1.0.0] - 2026-10-17
+
+The first stable release, and the first on PyPI: `pipx install syncdot`.
+
+The command-line interface, `config.yaml`, `manifest.yaml`, `vars.yaml`
+(including its `env:` section), the dotfiles repo layout, the generated
+`~/.config/environment.d/99-env.conf` and the exit codes are now stable: they
+only change incompatibly in a new major version. They are as of 0.9.2, which
+finished the review and code freeze that began with 0.8.0.
+
+### Added
+- Published to PyPI.
+- The dot-matrix logo, at the top of the README.
 
 ## [0.9.2] - 2026-10-07
 

@@ -51,13 +51,13 @@ The optional auto-sync service needs systemd.
 ### 1. Install the tool
 
 ```sh
-pipx install git+https://github.com/denomolo/syncdot.git@v0.9.2
+pipx install syncdot
 syncdot --version
 ```
 
-To upgrade later, run the same command with `--force` and the new tag. From
-1.0.0 on, syncdot is on PyPI: `pipx install syncdot`, then `pipx upgrade
-syncdot`. To install from a local checkout instead: `pipx install --force .`
+`pipx upgrade syncdot` upgrades it later. To install straight from GitHub
+instead: `pipx install git+https://github.com/denomolo/syncdot.git`, or
+from a local checkout: `pipx install --force .`
 
 **Coming from dotsync?** syncdot was called dotsync up to 0.8.0. Install
 syncdot, run any `syncdot` command, and your config, clone and state move
