@@ -2,26 +2,9 @@
   <img src="https://raw.githubusercontent.com/denomolo/syncdot/main/assets/logo.svg" alt="syncdot" width="600">
 </h1>
 
-Author's Note:
-I wanted to play a bit with Claude and see what it could do. Thought of building something that I could use on a daily basis. I've been a fan of chezmoi for a while but remembering the sync model and the syntax every time that I just wanted to backup or pull a file made me abandon it long ago.
+Bidirectional dotfile sync to your git repo of choice. You can edit the files in the repo or on a different machine and then pull them from anywhere; `syncdot` remembers what it last wrote to each file so it can tell which side changed and only asks a conflict policy to decide when both did. You can push different configurations to different branches and then merge freely or just copy files between branches.
 
-I built this with Claude code using these self imposed rules:
-* I decide on syntax.
-* I decide on the logic.
-* Python is the language of choice.
-* No handling of secrets or binary files.
-* Keep it as simple as possible.
-
-Let me know if you like it.
-##
-
-Bidirectional dotfile sync backed by a git repo, with per-machine profiles
-(git branches) and Jinja2 templating.
-
-Edit a dotfile on any machine and `syncdot sync` pushes it to your dotfiles
-repo; edit it in the repo (or on another machine) and the next sync pulls it
-down. syncdot remembers what it last wrote to each file, so it can tell
-which side changed and only asks a conflict policy to decide when both did.
+I wrote this little program because I wanted to play with Claude and see what it could do. I also wanted a simple and intuitive way of backing up my configuration to GitHub without needing to remember any special syntax.
 
 ## Contents
 
@@ -39,7 +22,6 @@ which side changed and only asks a conflict policy to decide when both did.
 - [Development](#development)
 - [Changelog](#changelog)
 - [License](#license)
-- [How it works](#how-it-works)
 
 ## Install
 
@@ -127,7 +109,7 @@ the repo later: `sync` reports them until you `pull` them.
 | Command | What it does |
 | --- | --- |
 | `syncdot init REPO [--new]` | Set syncdot up on this machine: clone (or start) your dotfiles repo and write the config. |
-| `syncdot sync` | Two-way sync of every tracked file (see [How it works](#how-it-works)). |
+| `syncdot sync` | Two-way sync of every tracked file. |
 | `syncdot status [PATH...] [--diff]` | Show what `sync` would do for each file (or just `PATH`s), including changes waiting on GitHub, without changing anything; `--diff` shows how files differ. |
 | `syncdot push [PATH...]` | Copy this machine's version to the repo, for every file or just `PATH`s. Commits and pushes. |
 | `syncdot pull [PATH...] [--yes]` | Copy the repo's version to this machine, for every file or just `PATH`s; asks before overwriting local changes. |
@@ -302,19 +284,6 @@ A profile is a git branch. `base` holds what every machine shares; each
 other profile is a `profiles/<name>` branch that starts as a copy of `base`
 and adds its own commits on top.
 
-```mermaid
-%%{init: {"gitGraph": {"mainBranchName": "base", "rotateCommitLabel": false, "parallelCommits": false}}}%%
-gitGraph
-    commit id: "add .vimrc"
-    commit id: "add kitty"
-    branch profiles/laptop
-    commit id: "laptop: bigger font"
-    checkout base
-    commit id: "add starship"
-    checkout profiles/laptop
-    merge base id: "sync merges base"
-```
-
 ```sh
 syncdot profile new laptop     # create profiles/laptop from base
 syncdot profile set laptop     # make it this machine's active profile
@@ -457,20 +426,9 @@ isn't a conflict: `sync` leaves it alone until you `pull` or `push` it.)
 | `newer-wins` | The newer side wins: the file's modification time on disk vs the time of the last commit that changed it in the repo. |
 | `repo-wins` | The repo's version wins and overwrites the local file. |
 
-(Before 0.8.0 these were `machine-wins`, `last-write-wins` and `git-wins`;
-the old names still work.)
-
 `local-wins` is the default because it never loses anything: the repo's
 version it replaces stays in git history, while a local file that gets
-overwritten is gone. The sync output shows where to find it:
-
-```
-!  ~/.vimrc  [local-wins; repo version kept in history at 3f2c1ab]
-```
-```sh
-git -C ~/.local/share/syncdot/repo show 3f2c1ab:files/.vimrc   # view it
-syncdot push ~/.vimrc                                           # after restoring the file
-```
+overwritten is gone.
 
 `syncdot push` and `syncdot pull` are one-off overrides equivalent to
 `local-wins` and `repo-wins` (and `pull` asks before overwriting local
@@ -530,71 +488,6 @@ include breaking changes, which are always called out there.
 Copyright (c) 2026 Ariel Shatil. syncdot is released under the
 [MIT License](LICENSE). (Versions up to 0.8.0 were released under the GPL
 3.0 or later.)
-
-## How it works
-
-Three places are involved: your files on disk, a local clone of your
-dotfiles repo, and GitHub. A machine-local state file records the hash of
-what was last synced for each file, which is how syncdot tells which side
-changed. Templates (`.j2`) are rendered on the way to disk.
-
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 28, "padding": 6, "diagramPadding": 4}}}%%
-flowchart LR
-    state["state.json<br/>last-synced hashes"]
-    disk["Disk<br/>~/.vimrc …"]
-    clone["Local clone<br/>~/.local/share/syncdot/repo"]
-    gh[("GitHub")]
-    state -.- disk
-    disk -- "push / add" --> clone
-    clone -- "pull / checkout" --> disk
-    clone -- "git push" --> gh
-    gh -- "git pull" --> clone
-```
-
-### What `syncdot sync` does
-
-On a profile other than `base`, sync first merges `base` into the
-profile branch. It then decides each file as below, commits and pushes if
-anything in the repo changed (plain pushes or conflicts the disk won), and
-saves the state file.
-
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 28, "padding": 6, "diagramPadding": 4}}}%%
-flowchart LR
-    start(["sync"]) --> pull["git pull<br/>profile branch"]
-    pull --> merge["merge base in<br/>(profiles only)"]
-    merge --> each["each file:<br/>decide + act"]
-    each --> commit["commit + push<br/>if repo changed"]
-    commit --> save(["save state"])
-```
-
-### How each file is decided
-
-For every tracked file syncdot computes three hashes: the file on disk, the
-file in the repo (after rendering templates), and the one it recorded the
-last time it synced that file.
-
-```mermaid
-%%{init: {"flowchart": {"nodeSpacing": 18, "rankSpacing": 28, "padding": 6, "diagramPadding": 4}}}%%
-flowchart LR
-    f(["file"]) --> known{"synced<br/>before?"}
-    known -- no --> samenew{"disk =<br/>repo?"}
-    samenew -- yes --> recnew["· record"]
-    samenew -- no --> wait["- skip until<br/>pull / push"]
-    known -- yes --> changed{"changed<br/>since?"}
-    changed -- neither --> nothing["· in sync"]
-    changed -- disk --> push["↑ push"]
-    changed -- repo --> pull["↓ pull"]
-    changed -- both --> same{"disk =<br/>repo?"}
-    same -- yes --> rec["· record"]
-    same -- no --> conf["! conflict"]
-```
-
-*record*: nothing to copy, just remember the hash. *skip*: a file never
-synced on this machine (missing here, or different) is left alone until you
-`pull` or `push` it. *conflict*: settled by `conflict_resolution` (default
-`local-wins`; see [Conflicts](#conflicts)).
 
 <details>
 <summary>syncdot in ASCII, for terminals and plain text</summary>

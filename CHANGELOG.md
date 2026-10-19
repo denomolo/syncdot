@@ -5,6 +5,12 @@ All notable changes to syncdot (called dotsync up to 0.8.0) are documented here.
 only come with a new major version. (On 0.x, minor releases could include
 breaking changes.)
 
+## [1.0.1] - 2026-10-19
+
+### Changed
+- Shorter, cleaned-up README, so the PyPI project page matches GitHub. No
+  code changes.
+
 ## [1.0.0] - 2026-10-17
 
 The first stable release, and the first on PyPI: `pipx install syncdot`.
