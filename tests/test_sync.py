@@ -161,12 +161,12 @@ def test_pull_glob_restores_files_missing_from_disk(sandbox):
     assert x.read_text() == "x\n" and y.read_text() == "y\n"
 
 
-def test_push_rejects_untracked_and_nested_paths(sandbox):
+def test_push_rejects_untracked_paths(sandbox):
     sandbox.file(".config/env/a.conf", "a")
     sandbox.run("add", "~/.config/env")
 
     assert "not tracked" in sandbox.run("push", "~/.nope", ok=False).output
-    assert "inside tracked directory" in sandbox.run("push", "~/.config/env/a.conf", ok=False).output
+    assert "not tracked" in sandbox.run("push", "~/.config/env/nope.conf", ok=False).output
 
 
 def test_pull_keeps_the_executable_bit(sandbox):

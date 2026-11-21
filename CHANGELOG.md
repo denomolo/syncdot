@@ -5,6 +5,31 @@ All notable changes to syncdot (called dotsync up to 0.8.0) are documented here.
 only come with a new major version. (On 0.x, minor releases could include
 breaking changes.)
 
+## [Unreleased]
+
+### Changed
+- Files inside a tracked directory are synced one by one instead of the
+  directory as a whole. `add`, `status`, `sync`, `push`, `pull`, `checkout`
+  and `remove` list each file, and changes to different files in the same
+  directory on different machines no longer conflict (with local-wins, the
+  other machine's change used to be pushed over). The manifest still has one
+  entry per directory, and state from 1.0 is converted on the first run.
+- `add` and `checkout` print one "Tracking" line per directory, with its
+  number of files. `push PATH` and `pull PATH` only list unchanged files
+  inside directories with `-v`.
+
+### Added
+- `status`, `push` and `pull` accept files and subdirectories inside a
+  tracked directory, and their globs match files inside directories.
+- `remove` of a file or subdirectory inside a tracked directory excludes it:
+  it goes on the entry's new optional `exclude:` list in `manifest.yaml`.
+  `add` of an excluded path includes it again.
+- A file deleted inside a tracked directory is shown as `[deleted]`.
+
+### Fixed
+- `add` and `checkout` refuse paths inside or containing a tracked
+  directory, which used to create overlapping entries.
+
 ## [1.0.1] - 2026-10-19
 
 ### Changed

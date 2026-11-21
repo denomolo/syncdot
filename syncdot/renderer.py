@@ -115,6 +115,8 @@ class Renderer:
         Each entry has:
           source: relative path in repo (e.g. "files/dot_zshrc.j2")
           dest:   absolute destination path (e.g. "~/.zshrc")
+          exclude (directories only, optional): paths inside it that aren't
+                  synced, relative to it (e.g. ["bundle/foo"])
         """
         manifest_path = self.repo_path / "manifest.yaml"
         if not manifest_path.exists():
@@ -131,8 +133,14 @@ class Renderer:
         for entry in entries:
             if "source" not in entry or "dest" not in entry:
                 raise RenderError(f"manifest.yaml: entry missing 'source' or 'dest': {entry}")
-            result.append({
+            item = {
                 "source": entry["source"],
                 "dest": str(Path(entry["dest"]).expanduser()),
-            })
+            }
+            exclude = entry.get("exclude")
+            if exclude is not None:
+                if not isinstance(exclude, list) or not all(isinstance(x, str) for x in exclude):
+                    raise RenderError(f"manifest.yaml: 'exclude' must be a list of paths: {entry}")
+                item["exclude"] = [x.strip("/") for x in exclude if x.strip("/")]
+            result.append(item)
         return result

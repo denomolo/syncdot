@@ -44,7 +44,8 @@ import yaml
 from .config import Config
 from .renderer import Renderer, RenderError
 from .repo import Repo, GitError
-from .state import ENV_D_NAME, IGNORED_NAMES, State, hash_path, is_binary, iter_dir_files, sha256, sha256_dir
+from .state import (DIR_SYNCED, ENV_D_NAME, IGNORED_NAMES, State, is_binary, iter_dir_files, sha256,
+                    sha256_dir, sha256_file)
 
 
 class Action(Enum):
@@ -68,6 +69,22 @@ class FileResult:
     error: Optional[str] = None
     skipped: Optional[str] = None       # why the file was skipped (e.g. "binary")
     diff: Optional[list[str]] = None    # unified diff lines, for `status --diff`
+    entry: Optional[dict] = None        # the tracked directory the file is inside
+    deleted: bool = False               # the file is deleted on the side being written
+
+
+@dataclass
+class Item:
+    """
+    One synced file: a manifest entry for a file, or a file inside a tracked
+    directory (`rel` is its path in there). Files inside directories are
+    copied verbatim, and may be missing on either side: deleting one on one
+    side deletes it on the other.
+    """
+    source: str            # path in the repo
+    dest: Path             # path on disk
+    entry: dict            # its manifest entry
+    rel: Optional[str] = None
 
 
 class PullDeclined(Exception):
@@ -102,6 +119,12 @@ class Syncer:
         self.include_binary = config.include_binary
         self._preview_root: Path | None = None
         self.notes: list[str] = []   # extra things to tell the user after the results
+        # What add/checkout started tracking: (disk path, repo path, number of
+        # files for a directory), and what remove stopped tracking: (repo
+        # path, the directory it's now excluded from, if any)
+        self.tracked: list[tuple[Path, str, int | None]] = []
+        self.untracked: list[tuple[str, Path | None]] = []
+        self._migrate_dir_states()
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
@@ -114,8 +137,8 @@ class Syncer:
         self._git_pull(branch)
 
         # 2. Process each file in the manifest
-        manifest = self.renderer.load_manifest()
-        results = [self._process_entry(entry) for entry in manifest]
+        selection = self._select(self.renderer.load_manifest(), None)
+        results = self._process_items(selection)
 
         # 3. Commit whatever changed in the repo: pushes, and conflicts the
         #    machine won (those are reported as CONFLICT, not PUSH)
@@ -133,9 +156,10 @@ class Syncer:
     def push_all(self, patterns: list[str] | None = None) -> list[FileResult]:
         """Force disk → repo for all files, or only those matching `patterns` (like local-wins)."""
         branch = self.config.branch
-        manifest = self._select_entries(self.renderer.load_manifest(), patterns)
-        results = [self._push_file(entry["source"], Path(entry["dest"])) for entry in manifest]
+        selection = self._select(self.renderer.load_manifest(), patterns)
+        results = [self._push_item(item) for item in _selected_items(selection)]
         if not self.dry_run:
+            self._mark_whole_dirs(selection)
             message = None
             if patterns:
                 pushed = [r.source for r in results if not r.error and not r.skipped]
@@ -157,34 +181,36 @@ class Syncer:
         """
         branch = self.config.branch
         self._git_pull(branch)
-        manifest = self._select_entries(self.renderer.load_manifest(), patterns)
-        at_risk = [Path(e["dest"]) for e in manifest if self._would_lose_local_changes(e)]
+        selection = self._select(self.renderer.load_manifest(), patterns)
+        items = _selected_items(selection)
+        at_risk = [item.dest for item in items if self._would_lose_local_changes(item)]
         if at_risk and not self.dry_run and not (confirm and confirm(at_risk)):
             raise PullDeclined("Nothing was pulled.")
-        results = [self._pull_file(entry["source"], Path(entry["dest"])) for entry in manifest]
+        results = [self._pull_item(item) for item in items]
         for r in results:
             if r.dest in at_risk and not r.error and not r.skipped:
                 r.resolved_by = "overwrites local changes"
         if not self.dry_run:
+            self._mark_whole_dirs(selection)
             self.state.save()
         return results + (self._env_results() if not patterns else [])
 
-    def _would_lose_local_changes(self, entry: dict) -> bool:
-        """True if writing the repo's version over `entry` would lose content
+    def _would_lose_local_changes(self, item: Item) -> bool:
+        """True if writing the repo's version over `item` would lose content
         that isn't in the repo: the file differs from it, and isn't simply the
         copy that was last synced here."""
-        dest = Path(entry["dest"])
-        try:
-            abs_source = self.renderer.resolve_source(entry["source"])
-            if abs_source.is_dir():
-                repo_hash = sha256_dir(abs_source, self.include_binary)
-            elif self._is_skipped_binary(abs_source, dest):
-                return False
-            else:
-                repo_hash = sha256(self.renderer.render(entry["source"]))
-        except RenderError:
-            return False   # reported when pulling
-        disk_hash = hash_path(dest, self.include_binary)
+        dest = item.dest
+        if item.rel is not None:
+            repo_hash = _file_hash(self.config.repo_path / item.source)
+        else:
+            try:
+                abs_source = self.renderer.resolve_source(item.source)
+                if self._is_skipped_binary(abs_source, dest):
+                    return False
+                repo_hash = sha256(self.renderer.render(item.source))
+            except RenderError:
+                return False   # reported when pulling
+        disk_hash = _file_hash(dest)
         if disk_hash is None or disk_hash == repo_hash:
             return False
         state = self.state.get(dest)
@@ -209,44 +235,31 @@ class Syncer:
             self.dry_run = old_dry
 
     def _status(self, patterns: list[str] | None, with_diff: bool) -> list[FileResult]:
-        manifest = self._select_entries(self.renderer.load_manifest(), patterns)
-        results = [self._process_entry(entry) for entry in manifest]
+        selection = self._select(self.renderer.load_manifest(), patterns)
+        results = self._process_items(selection)
         if with_diff:
-            for r in results:
+            for item, r in zip(_selected_items(selection), results):
                 if r.action != Action.NOTHING or r.skipped:
-                    r.diff = self.diff(r.source, r.dest)
+                    r.diff = self.diff(item)
         return results + (self._env_results() if not patterns else [])
 
-    def diff(self, source: str, dest: Path) -> list[str]:
+    def diff(self, item: Item) -> list[str]:
         """
         Unified diff from the repo's version (rendered, for templates) to the
-        file on this machine. Directories are compared file by file. Empty if
-        they match.
+        file on this machine. Empty if they match.
         """
+        shown = str(item.dest).replace(str(Path.home()), "~", 1)
+        labels = f"repo: {item.source}", f"here: {shown}"
+        abs_source = self.config.repo_path / item.source
+        if item.rel is not None:
+            return _diff_files(abs_source if abs_source.is_file() else None,
+                               item.dest if item.dest.is_file() else None, *labels)
         try:
-            abs_source = self.renderer.resolve_source(source)
-        except RenderError:
-            abs_source = self.config.repo_path / source
-        shown = str(dest).replace(str(Path.home()), "~", 1)
-
-        if abs_source.is_dir() or dest.is_dir():
-            def files(root: Path) -> dict[str, Path]:
-                if not root.is_dir():
-                    return {}
-                return {f.relative_to(root).as_posix(): f for f in iter_dir_files(root, include_binary=True)}
-            repo_files, disk_files = files(abs_source), files(dest)
-            lines = []
-            for rel in sorted(repo_files.keys() | disk_files.keys()):
-                lines += _diff_files(repo_files.get(rel), disk_files.get(rel),
-                                     f"repo: {source}/{rel}", f"here: {shown}/{rel}")
-            return lines
-
-        try:
-            repo_bytes = self.renderer.render(source) if abs_source.exists() else None
+            repo_bytes = self.renderer.render(item.source) if abs_source.exists() else None
         except RenderError as e:
-            return [f"(can't render {source}: {e})\n"]
-        disk_bytes = dest.read_bytes() if dest.is_file() else None
-        return _diff_bytes(repo_bytes, disk_bytes, f"repo: {source}", f"here: {shown}")
+            return [f"(can't render {item.source}: {e})\n"]
+        disk_bytes = item.dest.read_bytes() if item.dest.is_file() else None
+        return _diff_bytes(repo_bytes, disk_bytes, *labels)
 
     def add(self, locals_: list[Path], remote: str | None = None,
             allow_private: bool = False) -> list[FileResult]:
@@ -256,7 +269,9 @@ class Syncer:
         Each path is copied into files/<remote> (remote defaults to the
         path relative to ~, e.g. ~/.config/foo → files/.config/foo), gets a manifest entry and
         state, then everything is committed and pushed in a single commit.
-        With several paths, `remote` is always treated as a directory.
+        With several paths, `remote` is always treated as a directory. A
+        path excluded from a tracked directory is tracked as part of it again.
+        Directories get one result per file.
 
         Paths that can't be added (missing, already tracked, binary, private
         unless `allow_private`, …) are returned with `error` set; the rest are
@@ -267,39 +282,63 @@ class Syncer:
         manifest = self.renderer.load_manifest()
 
         results: list[FileResult] = []
-        planned: list[tuple[str, Path]] = []
+        planned: list[tuple[str, Path, dict | None]] = []
         for local in locals_:
             dest = local.expanduser().absolute()
             try:
-                source = self._plan_add(dest, remote, as_dir, manifest, planned, allow_private)
+                source, parent = self._plan_add(dest, remote, as_dir, manifest, planned, allow_private)
             except ValueError as e:
                 results.append(FileResult(dest=dest, source="", action=Action.PUSH, error=str(e)))
                 continue
-            planned.append((source, dest))
+            planned.append((source, dest, parent))
             results.append(FileResult(dest=dest, source=source, action=Action.PUSH))
 
-        if self.dry_run or not planned:
+        if not planned:
             return results
 
-        self.repo.checkout(branch)
+        if not self.dry_run:
+            self.repo.checkout(branch)
+        done: list[FileResult] = []
         added = []
-        for i, r in enumerate(results):
+        for r in results:
             if r.error:
+                done.append(r)
                 continue
-            results[i] = r = self._push_file(r.source, r.dest, allow_template=True)
-            if not r.error:
+            parent = next(p for s, d, p in planned if d == r.dest)
+            if parent is not None:
+                # Excluded from a tracked directory: include it again
+                rel = r.dest.relative_to(parent["dest"]).as_posix()
+                if not self.dry_run:
+                    self._edit_manifest_excludes(parent["source"], drop=[rel])
+                entry = {**parent, "exclude": [x for x in parent.get("exclude", []) if not _under(x, rel)]}
+                items = [i for i in self._items(entry) if _under(i.rel, rel)]
+            else:
+                entry = {"source": r.source, "dest": str(r.dest)}
+                items = self._items(entry)
+            file_results = [self._push_item(i, allow_template=True) for i in items]
+            is_dir = parent is not None or not items or items[0].rel is not None
+            if parent is None and (is_dir or not file_results[0].error) and not self.dry_run:
                 self._append_manifest_entry(r.source, r.dest)
+                if is_dir:
+                    self.state.mark_dir(r.dest)
+            if is_dir or not file_results[0].error:
+                self.tracked.append((r.dest, r.source, len(items) if is_dir else None))
                 added.append(r.source)
-        if added:
+            done += file_results or [FileResult(dest=r.dest, source=r.source, action=Action.NOTHING)]
+        if added and not self.dry_run:
             message = f"add: {added[0]}" if len(added) == 1 else f"add: {len(added)} files\n\n" + "\n".join(added)
             self._git_commit_and_push(branch, message=message)
             self.state.save()
-        return results
+        return done
 
     def _plan_add(self, dest: Path, remote: str | None, as_dir: bool,
-                  manifest: list[dict], planned: list[tuple[str, Path]],
-                  allow_private: bool = False) -> str:
-        """Validate adding `dest` and return its repo source path, or raise ValueError."""
+                  manifest: list[dict], planned: list[tuple[str, Path, dict | None]],
+                  allow_private: bool = False) -> tuple[str, dict | None]:
+        """
+        Validate adding `dest` and return its repo source path, plus the
+        tracked directory entry it's excluded from (None for a new entry);
+        raise ValueError if it can't be added.
+        """
         if not dest.exists():
             raise ValueError(f"Local path not found: {dest}")
         if dest.is_symlink():
@@ -319,6 +358,30 @@ class Syncer:
                     "dotfiles repo (use --allow-private to track it anyway)"
                 )
 
+        for other_source, other_dest, _ in planned:
+            if other_dest == dest:
+                raise ValueError(f"{dest} was given more than once")
+        for entry in manifest:
+            entry_dest = Path(entry["dest"])
+            if entry_dest == dest:
+                raise ValueError(f"{dest} is already tracked (source: {entry['source']})")
+            if dest.is_relative_to(entry_dest) and self._entry_is_dir(entry):
+                rel = dest.relative_to(entry_dest).as_posix()
+                excludes = entry.get("exclude", [])
+                outer = next((x for x in excludes if _under(rel, x) and x != rel), None)
+                if outer is not None:
+                    raise ValueError(f"{dest} is inside {entry_dest / outer}, which is excluded "
+                                     f"from {entry_dest}; add that instead")
+                if not any(_under(x, rel) for x in excludes):
+                    raise ValueError(f"{dest} is already tracked as part of {entry_dest}")
+                if remote is not None:
+                    raise ValueError(f"{dest} is part of tracked directory {entry_dest}, "
+                                     "so --remote can't place it elsewhere")
+                return f"{entry['source']}/{rel}", entry
+            if entry_dest.is_relative_to(dest):
+                raise ValueError(f"{dest} contains {entry_dest}, which is already tracked; "
+                                 "remove that first")
+
         files_root = self.config.repo_path / "files"
         if remote is None:
             # Mirror the path under ~ so checkout's default (~/<remote>) maps it back
@@ -335,18 +398,14 @@ class Syncer:
         source = f"files/{repo_source.relative_to(files_root.resolve())}"
 
         for entry in manifest:
-            if Path(entry["dest"]) == dest:
-                raise ValueError(f"{dest} is already tracked (source: {entry['source']})")
             if entry["source"] == source:
                 raise ValueError(f"{source} is already used by {entry['dest']}")
-        for other_source, other_dest in planned:
-            if other_dest == dest:
-                raise ValueError(f"{dest} was given more than once")
+        for other_source, other_dest, _ in planned:
             if other_source == source:
                 raise ValueError(f"{source} would also be used by {other_dest}; use --remote to separate them")
         if repo_source.exists():
             raise ValueError(f"{source} already exists in the repo")
-        return source
+        return source, None
 
     @_previewable
     def checkout(self, patterns: list[str], local: Path | None = None,
@@ -359,7 +418,7 @@ class Syncer:
         manifest entry and state, then the manifest change is committed and
         pushed. With several files, `local` is always treated as a directory.
         An existing local file with different content is only overwritten
-        when `force` is set.
+        when `force` is set. Directories get one result per file.
         """
         branch = self.config.branch
         self._git_pull(branch)
@@ -379,24 +438,35 @@ class Syncer:
             planned.append((source, dest))
             results.append(FileResult(dest=dest, source=source, action=Action.PULL))
 
-        if self.dry_run or not planned:
+        if not planned:
             return results
 
-        self.repo.checkout(branch)
+        if not self.dry_run:
+            self.repo.checkout(branch)
+        done: list[FileResult] = []
         added = []
-        for i, r in enumerate(results):
+        for r in results:
             if r.error:
+                done.append(r)
                 continue
-            results[i] = r = self._pull_file(r.source, r.dest)
-            if not r.error:
-                self._append_manifest_entry(r.source, r.dest)
+            entry = {"source": r.source, "dest": str(r.dest)}
+            items = self._items(entry)
+            file_results = [self._pull_item(i) for i in items]
+            is_dir = not items or items[0].rel is not None
+            if is_dir or not file_results[0].error:
+                if not self.dry_run:
+                    self._append_manifest_entry(r.source, r.dest)
+                    if is_dir:
+                        self.state.mark_dir(r.dest)
+                self.tracked.append((r.dest, r.source, len(items) if is_dir else None))
                 added.append(r.source)
-        if added:
+            done += file_results or [FileResult(dest=r.dest, source=r.source, action=Action.NOTHING)]
+        if added and not self.dry_run:
             message = (f"checkout: {added[0]}" if len(added) == 1
                        else f"checkout: {len(added)} files\n\n" + "\n".join(added))
             self._git_commit_and_push(branch, message=message)
             self.state.save()
-        return results + self._env_results()
+        return done + self._env_results()
 
     def _expand_sources(self, patterns: list[str]) -> list[str]:
         """Expand repo paths/globs (relative to files/) into manifest sources."""
@@ -438,8 +508,12 @@ class Syncer:
         for entry in manifest:
             if entry["source"] == source:
                 raise ValueError(f"{source} is already tracked (dest: {entry['dest']})")
+            if source.startswith(entry["source"] + "/"):
+                raise ValueError(f"{source} is already tracked as part of {entry['source']}")
             if Path(entry["dest"]) == dest:
                 raise ValueError(f"{dest} is already tracked (source: {entry['source']})")
+            if dest.is_relative_to(entry["dest"]) or Path(entry["dest"]).is_relative_to(dest):
+                raise ValueError(f"{dest} overlaps tracked path {entry['dest']}")
         for other_source, other_dest in planned:
             if other_dest == dest:
                 raise ValueError(f"{dest} would also be written by {other_source}")
@@ -524,7 +598,8 @@ class Syncer:
         # Templates are rendered from the new values whether or not we write them
         self.renderer._vars = new_vars
         env = self._render_env(new_vars)   # refuse edits that would break the env
-        templates = [e for e in self.renderer.load_manifest() if e["source"].endswith(".j2")]
+        templates = [e for e in self.renderer.load_manifest()
+                     if e["source"].endswith(".j2") and not self._entry_is_dir(e)]
         results = [r for r in (self._process_entry(e) for e in templates)
                    if r.action != Action.NOTHING or r.error]
         if self.dry_run:
@@ -630,33 +705,131 @@ class Syncer:
         _update_systemd_env(env, old_names - env.keys())
         return [result]
 
-    def _select_entries(self, manifest: list[dict], patterns: list[str] | None) -> list[dict]:
-        """
-        Manifest entries whose dest matches one of `patterns` (all if none given).
+    # ── Selecting files ────────────────────────────────────────────────────────
 
-        Patterns are disk paths; globs are matched against tracked dests, not
-        the filesystem, so files missing from disk can still be selected.
-        Raises ValueError if any pattern matches no tracked entry.
+    def _entry_is_dir(self, entry: dict) -> bool:
+        """True for an entry that tracks a directory (judged by the repo side first)."""
+        source, dest = self.config.repo_path / entry["source"], Path(entry["dest"])
+        if source.exists():
+            return source.is_dir()
+        if dest.exists():
+            return dest.is_dir()
+        return self.state.dir_synced(dest)
+
+    def _items(self, entry: dict) -> list[Item]:
         """
+        The files an entry covers: the file itself, or for a directory every
+        file in it on either side, or synced here before (so deletions are
+        seen), minus its excludes. Symlinks, nested .git directories and
+        (unless include_binary) binary files are left out, as on disk.
+        """
+        dest = Path(entry["dest"])
+        if not self._entry_is_dir(entry):
+            return [Item(entry["source"], dest, entry)]
+        self._migrate_dir_state(entry)
+        roots = (self.config.repo_path / entry["source"], dest)
+        rels = set(self.state.paths_under(dest))
+        for root in roots:
+            if root.is_dir():
+                rels.update(f.relative_to(root).as_posix() for f in iter_dir_files(root, self.include_binary))
+        excludes = entry.get("exclude", [])
+        return [Item(f"{entry['source']}/{rel}", dest / rel, entry, rel) for rel in sorted(rels)
+                if not any(_under(rel, x) for x in excludes)
+                and not any(_left_out(root, rel, self.include_binary) for root in roots)]
+
+    def _migrate_dir_states(self) -> None:
+        """
+        Convert directory state from 1.0 and earlier before anything is
+        pulled, while the clone still holds what was last synced.
+        """
+        if not any(v.last_applied_hash != DIR_SYNCED and Path(k).is_dir()
+                   for k, v in self.state.files.items()):
+            return
+        try:
+            manifest = self.renderer.load_manifest()
+        except (RenderError, yaml.YAMLError):
+            return
+        for entry in manifest:
+            if self._entry_is_dir(entry):
+                self._migrate_dir_state(entry)
+
+    def _migrate_dir_state(self, entry: dict) -> None:
+        """
+        Up to 1.0 a directory had one state hash for all its files. If one
+        side still matches it, that side is what was last synced: record each
+        of its files as synced. Otherwise only files that match on both sides
+        count as synced, and the others are conflicts.
+        """
+        dest = Path(entry["dest"])
+        old = self.state.get(dest)
+        if old is None or old.last_applied_hash == DIR_SYNCED:
+            return
+        for root in (dest, self.config.repo_path / entry["source"]):
+            if sha256_dir(root, self.include_binary) == old.last_applied_hash:
+                for f in iter_dir_files(root, self.include_binary):
+                    self.state.record(dest / f.relative_to(root), f.read_bytes())
+                break
+        self.state.mark_dir(dest)
+
+    def _select(self, manifest: list[dict], patterns: list[str] | None
+                ) -> list[tuple[dict, str | None, list[Item]]]:
+        """
+        What `patterns` (disk paths) pick out of the manifest, all of it if
+        none are given: (entry, rel, items) for each whole entry (rel None) or
+        path inside a tracked directory (rel is relative to it), with the
+        files it covers.
+
+        Globs are matched against tracked paths, files inside directories
+        included, not the filesystem, so files missing from disk can still be
+        selected. Raises ValueError if any pattern matches nothing tracked.
+        """
+        cache: dict[int, list[Item]] = {}
+        def items(i: int) -> list[Item]:
+            if i not in cache:
+                cache[i] = self._items(manifest[i])
+            return cache[i]
+
         if not patterns:
-            return manifest
-        selected: dict[int, dict] = {}
+            return [(e, None, items(i)) for i, e in enumerate(manifest)]
+        picked: dict[tuple[int, str | None], None] = {}
         for pattern in patterns:
             path = os.path.abspath(os.path.expanduser(pattern))
-            if glob.has_magic(path):
-                matches = [i for i, e in enumerate(manifest)
-                           if fnmatch.fnmatchcase(os.path.abspath(e["dest"]), path)]
-            else:
-                matches = [i for i, e in enumerate(manifest) if os.path.abspath(e["dest"]) == path]
-            if not matches:
-                parent = next((e for e in manifest if Path(path).is_relative_to(e["dest"])), None)
-                if parent:
-                    raise ValueError(f"{path} is inside tracked directory {parent['dest']}; "
-                                     "use that directory instead")
+            found: list[tuple[int, str | None]] = []
+            for i, e in enumerate(manifest):
+                dest = os.path.abspath(e["dest"])
+                if glob.has_magic(path):
+                    if fnmatch.fnmatchcase(dest, path):
+                        found.append((i, None))
+                    else:
+                        found += [(i, it.rel) for it in items(i)
+                                  if it.rel is not None and fnmatch.fnmatchcase(str(it.dest), path)]
+                elif dest == path:
+                    found.append((i, None))
+                elif Path(path).is_relative_to(dest):
+                    rel = Path(path).relative_to(dest).as_posix()
+                    if any(it.rel is not None and _under(it.rel, rel) for it in items(i)):
+                        found.append((i, rel))
+                    elif any(_under(rel, x) for x in e.get("exclude", [])):
+                        raise ValueError(f"{pattern} is excluded from tracked directory {e['dest']}")
+            if not found:
                 raise ValueError(f"{pattern} is not tracked")
-            for i in matches:
-                selected.setdefault(i, manifest[i])
-        return [selected[i] for i in sorted(selected)]
+            picked.update(dict.fromkeys(found))
+
+        selection = []
+        for i, rel in sorted(picked, key=lambda k: (k[0], k[1] or "")):
+            # Skip paths that a whole entry or a directory above them covers
+            if rel is not None and any(j == i and (r is None or r != rel and _under(rel, r))
+                                       for j, r in picked):
+                continue
+            selection.append((manifest[i], rel,
+                              [it for it in items(i) if rel is None or _under(it.rel, rel)]))
+        return selection
+
+    def _mark_whole_dirs(self, selection: list[tuple[dict, str | None, list[Item]]]) -> None:
+        """Directories selected as a whole are now synced here as a whole."""
+        for entry, rel, _ in selection:
+            if rel is None and self._entry_is_dir(entry):
+                self.state.mark_dir(Path(entry["dest"]))
 
     def remove(self, patterns: list[str]) -> list[FileResult]:
         """
@@ -664,43 +837,57 @@ class Syncer:
         against tracked paths, like push and pull).
 
         Drops their manifest entries, deletes their sources from the repo,
-        forgets their state, then commits and pushes once. Files on disk are
-        left untouched, and may already be gone.
+        forgets their state, then commits and pushes once. A path inside a
+        tracked directory is added to the directory's exclude list instead.
+        Files on disk are left untouched, and may already be gone.
         """
         branch = self.config.branch
         manifest = self.renderer.load_manifest()
-        selected = self._select_entries(manifest, patterns)
-        results = [FileResult(dest=Path(e["dest"]), source=e["source"], action=Action.UNTRACK)
-                   for e in selected]
+        selection = self._select(manifest, patterns)
+        results = []
+        for entry, rel, items in selection:
+            results += [FileResult(dest=i.dest, source=i.source, action=Action.UNTRACK,
+                                   entry=entry if i.rel is not None else None) for i in items]
+            if not items:
+                results.append(FileResult(dest=Path(entry["dest"]), source=entry["source"],
+                                          action=Action.UNTRACK))
+            self.untracked.append((entry["source"], None) if rel is None
+                                  else (f"{entry['source']}/{rel}", Path(entry["dest"])))
         if self.dry_run:
             return results
 
         self.repo.checkout(branch)
-        remaining = [e for e in manifest if e not in selected]
-        for entry in selected:
-            self._remove_manifest_entry(entry["source"])
-            # Keep the source if another (hand-written) entry still points at it
-            if not any(e["source"] == entry["source"] for e in remaining):
-                p = self.config.repo_path / entry["source"]
-                if p.is_dir() and not p.is_symlink():
-                    shutil.rmtree(p)
-                elif p.exists() or p.is_symlink():
-                    p.unlink()
-            self.state.forget(Path(entry["dest"]))
+        whole = [e for e, rel, _ in selection if rel is None]
+        remaining = [e for e in manifest if not any(e is w for w in whole)]
+        excludes: dict[str, list[str]] = {}
+        for entry, rel, items in selection:
+            if rel is None:
+                self._remove_manifest_entry(entry["source"])
+                # Keep the source if another (hand-written) entry still points at it
+                if not any(e["source"] == entry["source"] for e in remaining):
+                    _delete_path(self.config.repo_path / entry["source"])
+                self.state.forget_tree(Path(entry["dest"]))
+            else:
+                excludes.setdefault(entry["source"], []).append(rel)
+                path = self.config.repo_path / entry["source"] / rel
+                _delete_path(path)
+                _prune_empty_dirs(path.parent, self.config.repo_path / entry["source"])
+                for item in items:
+                    self.state.forget(item.dest)
+        for source, rels in excludes.items():
+            self._edit_manifest_excludes(source, add=rels)
 
-        sources = [e["source"] for e in selected]
+        sources = [source for source, _ in self.untracked]
         message = (f"remove: {sources[0]}" if len(sources) == 1
                    else f"remove: {len(sources)} files\n\n" + "\n".join(sources))
         self._git_commit_and_push(branch, message=message)
         self.state.save()
         return results
 
-    def _remove_manifest_entry(self, source: str) -> None:
-        """Remove the list item whose source matches, editing text to keep comments."""
-        manifest_path = self.config.repo_path / "manifest.yaml"
-        text = manifest_path.read_text()
-        lines = text.splitlines(keepends=True)
+    # ── Manifest editing ───────────────────────────────────────────────────────
 
+    def _find_manifest_item(self, lines: list[str], source: str) -> tuple[int, int, int]:
+        """Line range [start, end) and indent of the list item whose source matches."""
         for i, line in enumerate(lines):
             m = re.match(r"^(\s*)-(\s|$)", line)
             if not m:
@@ -719,12 +906,17 @@ class Syncer:
                 continue
             if (isinstance(item, list) and len(item) == 1 and isinstance(item[0], dict)
                     and item[0].get("source") == source):
-                # Also drop the blank separator line `add` puts before entries
-                start = i - 1 if i > 0 and not lines[i - 1].strip() else i
-                del lines[start:end]
-                break
-        else:
-            raise ValueError(f"Could not find manifest entry for {source}")
+                return i, end, indent
+        raise ValueError(f"Could not find manifest entry for {source}")
+
+    def _remove_manifest_entry(self, source: str) -> None:
+        """Remove the list item whose source matches, editing text to keep comments."""
+        manifest_path = self.config.repo_path / "manifest.yaml"
+        lines = manifest_path.read_text().splitlines(keepends=True)
+        i, end, _ = self._find_manifest_item(lines, source)
+        # Also drop the blank separator line `add` puts before entries
+        start = i - 1 if i > 0 and not lines[i - 1].strip() else i
+        del lines[start:end]
 
         new_text = "".join(lines)
         # An emptied list parses as null, which the manifest loader rejects
@@ -733,6 +925,30 @@ class Syncer:
         remaining = (yaml.safe_load(new_text) or {}).get("files") or []
         if any(isinstance(e, dict) and e.get("source") == source for e in remaining):
             raise ValueError(f"Could not cleanly remove manifest entry for {source}")
+        manifest_path.write_text(new_text)
+
+    def _edit_manifest_excludes(self, source: str, add: list[str] = (), drop: list[str] = ()) -> None:
+        """
+        Add paths to a directory entry's exclude list, or drop the ones at or
+        under `drop` paths, rewriting only that entry so comments elsewhere stay.
+        """
+        manifest_path = self.config.repo_path / "manifest.yaml"
+        lines = manifest_path.read_text().splitlines(keepends=True)
+        start, end, indent = self._find_manifest_item(lines, source)
+        item = yaml.safe_load(textwrap.dedent("".join(lines[start:end])))[0]
+        excludes = [x for x in item.get("exclude") or [] if not any(_under(x, d) for d in drop)]
+        excludes += [x for x in add if x not in excludes]
+        item.pop("exclude", None)
+        if excludes:
+            item["exclude"] = sorted(excludes)
+        dumped = yaml.safe_dump([item], sort_keys=False)
+        lines[start:end] = [" " * indent + line + "\n" for line in dumped.splitlines()]
+
+        new_text = "".join(lines)
+        entries = (yaml.safe_load(new_text) or {}).get("files") or []
+        if [e.get("exclude") for e in entries if isinstance(e, dict)
+                and e.get("source") == source] != [item.get("exclude")]:
+            raise ValueError(f"Could not cleanly edit the manifest entry for {source}")
         manifest_path.write_text(new_text)
 
     def _append_manifest_entry(self, source: str, dest: Path) -> None:
@@ -752,25 +968,39 @@ class Syncer:
 
     # ── Per-file logic ─────────────────────────────────────────────────────────
 
+    def _process_items(self, selection: list[tuple[dict, str | None, list[Item]]]) -> list[FileResult]:
+        """Decide and act on each selected file, as sync does."""
+        results = [self._process_item(item) for item in _selected_items(selection)]
+        # A directory never synced here whose files all match already is in
+        # sync as a whole, so files that appear in it later are synced too
+        for entry, rel, items in selection:
+            dest = Path(entry["dest"])
+            if (rel is None and items and items[0].rel is not None and not self.dry_run
+                    and not self.state.dir_synced(dest)
+                    and all(r.action == Action.NOTHING and not r.skipped and not r.error
+                            for r in results if r.entry is entry)):
+                self.state.mark_dir(dest)
+        return results
+
+    def _process_item(self, item: Item) -> FileResult:
+        if item.rel is None:
+            return self._process_entry(item.entry)
+        return self._process_dir_file(item)
+
     def _process_entry(self, entry: dict) -> FileResult:
-        source = entry["source"]
-        dest = Path(entry["dest"])
+        item = Item(entry["source"], Path(entry["dest"]), entry)
+        source, dest = item.source, item.dest
 
         try:
             abs_source = self.renderer.resolve_source(source)
-            if abs_source.is_dir():
-                # Directories are copied verbatim, never rendered
-                rendered = None
-                repo_hash = sha256_dir(abs_source, self.include_binary)
-            else:
-                if self._is_skipped_binary(abs_source, dest):
-                    return FileResult(dest=dest, source=source, action=Action.NOTHING, skipped="binary")
-                rendered = self.renderer.render(source)
-                repo_hash = sha256(rendered)
+            if self._is_skipped_binary(abs_source, dest):
+                return FileResult(dest=dest, source=source, action=Action.NOTHING, skipped="binary")
+            rendered = self.renderer.render(source)
+            repo_hash = sha256(rendered)
         except RenderError as e:
             return FileResult(dest=dest, source=source, action=Action.NOTHING, error=str(e))
 
-        disk_hash    = hash_path(dest, self.include_binary)
+        disk_hash    = _file_hash(dest)
         state_entry  = self.state.get(dest)
         last_hash    = state_entry.last_applied_hash if state_entry else None
 
@@ -789,8 +1019,7 @@ class Syncer:
         elif not disk_changed and not repo_changed:
             action = Action.NOTHING
         elif disk_hash == repo_hash:
-            # Both sides changed identically (e.g. binaries newly excluded
-            # from directory hashes) — just record the new state
+            # Both sides changed identically — just record the new state
             if not self.dry_run:
                 self.state.record_hash(dest, repo_hash)
             return FileResult(dest=dest, source=source, action=Action.NOTHING)
@@ -801,45 +1030,79 @@ class Syncer:
         else:
             action = Action.CONFLICT
 
-        return self._act(source, dest, rendered, action)
+        return self._act(item, rendered, action)
 
-    def _act(self, source: str, dest: Path, rendered: bytes | None, action: Action) -> FileResult:
+    def _process_dir_file(self, item: Item) -> FileResult:
+        """
+        The same decision for a file inside a tracked directory, where either
+        side may be missing (hash None): a file added or deleted on one side
+        since the last sync is added or deleted on the other.
+        """
+        repo_hash = _file_hash(self.config.repo_path / item.source)
+        disk_hash = _file_hash(item.dest)
+        state = self.state.get(item.dest)
+        last_hash = state.last_applied_hash if state else None
+
+        if disk_hash == repo_hash:
+            if not self.dry_run:
+                if disk_hash is None:
+                    self.state.forget(item.dest)
+                elif disk_hash != last_hash:
+                    self.state.record_hash(item.dest, disk_hash)
+            return self._result(item, Action.NOTHING)
+        if last_hash is None and not self.state.dir_synced(Path(item.entry["dest"])):
+            return self._result(item, Action.NOTHING, skipped=NOT_SET_UP)
+        if repo_hash == last_hash:
+            action = Action.PUSH       # changed, added or deleted here
+        elif disk_hash == last_hash:
+            action = Action.PULL       # changed, added or deleted in the repo
+        else:
+            action = Action.CONFLICT
+        return self._act(item, None, action)
+
+    def _result(self, item: Item, action: Action, **kwargs) -> FileResult:
+        return FileResult(dest=item.dest, source=item.source, action=action,
+                          entry=item.entry if item.rel is not None else None, **kwargs)
+
+    def _act(self, item: Item, rendered: bytes | None, action: Action) -> FileResult:
         if action == Action.NOTHING:
-            return FileResult(dest=dest, source=source, action=action)
+            return self._result(item, action)
 
         if action == Action.PULL:
-            return self._pull_file(source, dest, rendered)
+            return self._pull_item(item, rendered)
 
         if action == Action.PUSH:
-            return self._push_file(source, dest)
+            return self._push_item(item)
 
         if action == Action.CONFLICT:
-            return self._resolve_conflict(source, dest, rendered)
+            return self._resolve_conflict(item, rendered)
 
         raise ValueError(f"Unknown action: {action}")
 
     # ── Atomic file operations ─────────────────────────────────────────────────
 
+    def _pull_item(self, item: Item, rendered: bytes | None = None) -> FileResult:
+        if item.rel is None:
+            return self._pull_file(item.source, item.dest, rendered)
+        return self._pull_dir_file(item)
+
+    def _push_item(self, item: Item, allow_template: bool = False) -> FileResult:
+        if item.rel is None:
+            return self._push_file(item.source, item.dest, allow_template)
+        return self._push_dir_file(item)
+
     def _pull_file(self, source: str, dest: Path, rendered: bytes | None = None) -> FileResult:
-        """Write rendered repo content (or a mirrored directory) to disk."""
+        """Write rendered repo content to disk."""
         try:
             abs_source = self.renderer.resolve_source(source)
-            if not abs_source.is_dir() and self._is_skipped_binary(abs_source, dest):
+            if self._is_skipped_binary(abs_source, dest):
                 return FileResult(dest=dest, source=source, action=Action.NOTHING, skipped="binary")
-            if rendered is None and not abs_source.is_dir():
+            if rendered is None:
                 rendered = self.renderer.render(source)
         except RenderError as e:
             return FileResult(dest=dest, source=source, action=Action.PULL, error=str(e))
 
         if self.dry_run:
-            return FileResult(dest=dest, source=source, action=Action.PULL)
-
-        if abs_source.is_dir():
-            try:
-                _mirror_dir(abs_source, dest, self.include_binary)
-            except Exception as e:
-                return FileResult(dest=dest, source=source, action=Action.PULL, error=str(e))
-            self.state.record_hash(dest, sha256_dir(abs_source, self.include_binary))
             return FileResult(dest=dest, source=source, action=Action.PULL)
 
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -859,6 +1122,26 @@ class Syncer:
 
         self.state.record(dest, rendered)
         return FileResult(dest=dest, source=source, action=Action.PULL)
+
+    def _pull_dir_file(self, item: Item) -> FileResult:
+        """Copy a file inside a tracked directory to disk verbatim, or delete it if the repo has none."""
+        repo_file = self.config.repo_path / item.source
+        result = self._result(item, Action.PULL, deleted=not repo_file.is_file())
+        if item.dest.is_dir():
+            result.error = f"{item.dest} is a directory here"
+        if self.dry_run or result.error:
+            return result
+        try:
+            if result.deleted:
+                item.dest.unlink(missing_ok=True)
+                _prune_empty_dirs(item.dest.parent, Path(item.entry["dest"]))
+                self.state.forget(item.dest)
+            else:
+                _copy_file(repo_file, item.dest)
+                self.state.record(item.dest, item.dest.read_bytes())
+        except OSError as e:
+            result.error = str(e)
+        return result
 
     def _push_file(self, source: str, dest: Path, allow_template: bool = False) -> FileResult:
         """
@@ -886,64 +1169,78 @@ class Syncer:
                 error=f"rendered from template {source}; edit the template in the repo "
                       f"instead (`syncdot pull {shown}` discards the local change)",
             )
-        if not dest.is_dir() and self._is_skipped_binary(repo_source, dest):
+        if self._is_skipped_binary(repo_source, dest):
             return FileResult(dest=dest, source=source, action=Action.NOTHING, skipped="binary")
         if self.dry_run:
             return FileResult(dest=dest, source=source, action=Action.PUSH)
 
         repo_source.parent.mkdir(parents=True, exist_ok=True)
         try:
-            if dest.is_dir():
-                _mirror_dir(dest, repo_source, self.include_binary)
-            else:
-                if repo_source.is_dir():
-                    shutil.rmtree(repo_source)
-                shutil.copy2(dest, repo_source)
+            if repo_source.is_dir():
+                shutil.rmtree(repo_source)
+            shutil.copy2(dest, repo_source)
         except Exception as e:
             return FileResult(dest=dest, source=source, action=Action.PUSH, error=str(e))
 
         # Update state to reflect current disk content
-        if repo_source.is_dir():
-            self.state.record_hash(dest, sha256_dir(repo_source, self.include_binary))
-        else:
-            self.state.record(dest, repo_source.read_bytes())
+        self.state.record(dest, repo_source.read_bytes())
         return FileResult(dest=dest, source=source, action=Action.PUSH)
+
+    def _push_dir_file(self, item: Item) -> FileResult:
+        """Copy a file inside a tracked directory to the repo, or delete the repo's copy if it's gone here."""
+        repo_file = self.config.repo_path / item.source
+        result = self._result(item, Action.PUSH, deleted=not item.dest.is_file())
+        if repo_file.is_dir():
+            result.error = f"{item.source} is a directory in the repo"
+        if self.dry_run or result.error:
+            return result
+        try:
+            if result.deleted:
+                repo_file.unlink(missing_ok=True)
+                _prune_empty_dirs(repo_file.parent, self.config.repo_path / item.entry["source"])
+                self.state.forget(item.dest)
+            else:
+                _copy_file(item.dest, repo_file)
+                self.state.record(item.dest, repo_file.read_bytes())
+        except OSError as e:
+            result.error = str(e)
+        return result
 
     # ── Conflict resolution ────────────────────────────────────────────────────
 
-    def _resolve_conflict(self, source: str, dest: Path, rendered: bytes | None) -> FileResult:
+    def _resolve_conflict(self, item: Item, rendered: bytes | None) -> FileResult:
         mode = self.config.conflict_resolution
 
         if mode == "local-wins":
-            return self._local_wins(source, dest, "local-wins")
+            return self._local_wins(item, "local-wins")
 
         if mode == "repo-wins":
-            result = self._pull_file(source, dest, rendered)
+            result = self._pull_item(item, rendered)
             result.resolved_by = "repo-wins"
             return result
 
         # newer-wins: compare disk mtime vs when the repo side was
         # committed. The clone's own mtime is useless: git rewrites the file
         # when it pulls, so it would always look newer than a local edit.
-        repo_source = self.config.repo_path / source
-        disk_mtime = _mtime(dest, self.include_binary)
-        repo_mtime = self.repo.last_commit_time(source)
+        # A file deleted here counts as oldest, so its content is kept.
+        disk_mtime = _mtime(item.dest)
+        repo_mtime = self.repo.last_commit_time(item.source)
         if repo_mtime is None:
-            repo_mtime = _mtime(repo_source, self.include_binary)
+            repo_mtime = _mtime(self.config.repo_path / item.source)
 
-        if disk_mtime >= repo_mtime:
-            result = self._local_wins(source, dest, "newer-wins → local")
+        if disk_mtime >= repo_mtime and item.dest.exists():
+            result = self._local_wins(item, "newer-wins → local")
         else:
-            result = self._pull_file(source, dest, rendered)
+            result = self._pull_item(item, rendered)
             result.resolved_by = "newer-wins → repo"
 
         result.action = Action.CONFLICT
         return result
 
-    def _local_wins(self, source: str, dest: Path, how: str) -> FileResult:
+    def _local_wins(self, item: Item, how: str) -> FileResult:
         """Push the disk version, noting where the repo's version can be recovered."""
-        previous = self.repo.last_commit_id(source)
-        result = self._push_file(source, dest)
+        previous = self.repo.last_commit_id(item.source)
+        result = self._push_item(item)
         result.resolved_by = how
         if previous and not result.error and not self.dry_run:
             result.resolved_by += f"; repo version kept in history at {previous}"
@@ -1307,43 +1604,69 @@ def find_private(path: Path, include_binary: bool = False) -> Path | None:
     return None
 
 
-def _mtime(path: Path, include_binary: bool = False) -> float:
-    """mtime of a file, or the newest file mtime inside a directory (0 if missing)."""
-    if path.is_dir():
-        return max((f.stat().st_mtime for f in iter_dir_files(path, include_binary)), default=0)
+def _mtime(path: Path) -> float:
+    """mtime of a file (0 if missing)."""
     return path.stat().st_mtime if path.exists() else 0
 
 
-def _mirror_dir(src: Path, dst: Path, include_binary: bool = False) -> None:
-    """
-    Make dst's contents match src: copy every file over, then delete files
-    and emptied directories in dst that src doesn't have. Entries in
-    IGNORED_NAMES, symlinks and (unless include_binary) binary files are
-    neither copied nor deleted, and are never written through.
-    """
-    if dst.exists() and not dst.is_dir():
-        dst.unlink()
-    dst.mkdir(parents=True, exist_ok=True)
+def _file_hash(path: Path) -> str | None:
+    """sha256 of a regular file's contents, or None if there's no file there."""
+    return sha256_file(path) if path.is_file() else None
 
-    wanted = set()
-    for f in iter_dir_files(src, include_binary):
-        rel = f.relative_to(src)
-        wanted.add(rel)
-        target = dst / rel
-        if target.is_symlink():
-            continue
-        if target.is_dir():
-            shutil.rmtree(target)
-        target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(f, target)
 
-    # Deepest paths first so directories are empty by the time we reach them
-    for child in sorted(dst.rglob("*"), reverse=True):
-        rel = child.relative_to(dst)
-        if rel in wanted or IGNORED_NAMES.intersection(rel.parts) or child.is_symlink():
-            continue
-        if child.is_file():
-            if include_binary or not is_binary(child):
-                child.unlink()
-        elif child.is_dir() and not (src / rel).is_dir() and not any(child.iterdir()):
-            child.rmdir()
+def _selected_items(selection: list[tuple[dict, str | None, list[Item]]]) -> list[Item]:
+    """The files of a selection, each once."""
+    items: dict[Path, Item] = {}
+    for _, _, its in selection:
+        for item in its:
+            items.setdefault(item.dest, item)
+    return list(items.values())
+
+
+def _under(rel: str, prefix: str) -> bool:
+    """True if relative path `rel` is `prefix` or inside it."""
+    return rel == prefix or rel.startswith(prefix + "/")
+
+
+def _left_out(root: Path, rel: str, include_binary: bool) -> bool:
+    """
+    True if `rel` inside directory `root` isn't synced: it's in or under an
+    ignored name or a symlink (never followed or written through), or a
+    binary file while binaries are excluded.
+    """
+    parts = rel.split("/")
+    if IGNORED_NAMES.intersection(parts):
+        return True
+    path = root
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            return True
+    return not include_binary and path.is_file() and is_binary(path)
+
+
+def _copy_file(src: Path, dst: Path) -> None:
+    """Copy a file with its mode, atomically replacing dst."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".syncdot_tmp")
+    try:
+        shutil.copy2(src, tmp)
+        tmp.replace(dst)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+def _delete_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def _prune_empty_dirs(path: Path, root: Path) -> None:
+    """Remove `path` and its parents while they're empty, up to (not including) `root`."""
+    while path != root and path.is_relative_to(root) and path.is_dir() \
+            and not path.is_symlink() and not any(path.iterdir()):
+        path.rmdir()
+        path = path.parent

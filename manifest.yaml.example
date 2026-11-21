@@ -3,6 +3,7 @@
 #
 # Source paths are relative to the repo root.
 # Files ending in .j2 are rendered as Jinja2 templates using vars.yaml.
+# A directory is copied verbatim, and each file in it is synced on its own.
 #
 # Profiles are branches: to change a file or variable for one profile, edit
 # it on that profile's branch. Changes on base are merged in on every sync.
@@ -25,6 +26,9 @@ files:
 
   - source: files/nvim
     dest: ~/.config/nvim
+    # Optional for directories: paths inside it that aren't synced
+    exclude:
+      - lazy-lock.json
 
   # ── Terminal ───────────────────────────────────────────────────────────────
   - source: files/dot_tmux.conf

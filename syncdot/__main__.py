@@ -57,9 +57,11 @@ ACTION_SYMBOLS = {
 }
 
 
-def print_results(results, verbose: bool = False, pending: bool = False) -> int:
+def print_results(results, verbose: bool = False, pending: bool = False, named: bool = False) -> int:
     """Print per-file results and a summary (pending=True words it as not yet
-    done). Returns the number of errors."""
+    done). Unchanged files are listed with verbose, and with named (the user
+    gave paths) except files inside tracked directories. Returns the number
+    of errors."""
     errors = 0
     for r in results:
         sym = ACTION_SYMBOLS[r.action]
@@ -68,12 +70,15 @@ def print_results(results, verbose: bool = False, pending: bool = False) -> int:
         if r.skipped:
             sym = click.style("-", fg="bright_black")
             line = f"  {sym}  {dest}" + click.style(f"  [skipped: {r.skipped}]", fg="bright_black")
+        if r.deleted and not r.skipped:
+            line += click.style("  [deleted]", fg="red")
         if r.resolved_by:
             line += click.style(f"  [{r.resolved_by}]", fg="yellow")
         if r.error:
             line += click.style(f"  ERROR: {r.error}", fg="red")
             errors += 1
-        if verbose or r.action != Action.NOTHING or r.error or r.skipped:
+        if (verbose or named and r.entry is None or r.action != Action.NOTHING
+                or r.error or r.skipped):
             click.echo(line)
 
     counts = {a: sum(1 for r in results if r.action == a and not r.skipped and not r.error) for a in Action}
@@ -101,6 +106,21 @@ def print_results(results, verbose: bool = False, pending: bool = False) -> int:
             "  to take the repo's version or `syncdot push <path>` to keep this machine's\n"
             "  (`syncdot pull` alone takes the repo's version of everything).", fg="bright_black"))
     return errors
+
+
+def home_relative(path: Path) -> str:
+    return str(path).replace(str(Path.home()), "~", 1)
+
+
+def print_tracked(tracked, template: str) -> None:
+    """One line per path add/checkout started tracking, with a directory's file count."""
+    if tracked:
+        click.echo()
+    for dest, source, count in tracked:
+        line = "  " + template.format(dest=home_relative(dest), source=click.style(source, fg="cyan"))
+        if count is not None:
+            line += f" ({count} file{'' if count == 1 else 's'})"
+        click.echo(line)
 
 
 def locked(command):
@@ -260,9 +280,9 @@ def sync(dry_run: bool, verbose: bool):
 def push(paths: tuple[str, ...], dry_run: bool, verbose: bool):
     """Copy this machine's files to the repo: all of them, or only PATHS.
 
-    PATHS are tracked files or directories on disk. Quoted glob patterns
-    are matched against tracked paths, so '~/.config/foo/*' works even for
-    files missing from disk.
+    PATHS are tracked files or directories on disk, or files inside a
+    tracked directory. Quoted glob patterns are matched against tracked
+    paths, so '~/.config/foo/*' works even for files missing from disk.
     """
     cfg = load_config_or_exit()
     click.echo(f"Pushing disk → repo (profile: {click.style(cfg.profile, fg='cyan')}) …\n")
@@ -272,7 +292,7 @@ def push(paths: tuple[str, ...], dry_run: bool, verbose: bool):
     except (ValueError, GitError, RenderError) as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    errors = print_results(results, verbose=verbose or bool(paths), pending=dry_run)
+    errors = print_results(results, verbose=verbose, pending=dry_run, named=bool(paths))
     for note in syncer.notes:
         click.echo(f"\n  {note}")
     if errors:
@@ -290,9 +310,9 @@ def push(paths: tuple[str, ...], dry_run: bool, verbose: bool):
 def pull(paths: tuple[str, ...], yes: bool, dry_run: bool, verbose: bool):
     """Copy the repo's files to this machine: all of them, or only PATHS.
 
-    PATHS are tracked files or directories on disk. Quoted glob patterns
-    are matched against tracked paths, so '~/.config/foo/*' works even for
-    files missing from disk. If this would overwrite local changes that
+    PATHS are tracked files or directories on disk, or files inside a
+    tracked directory. Quoted glob patterns are matched against tracked
+    paths, so '~/.config/foo/*' works even for files missing from disk. If this would overwrite local changes that
     aren't in the repo, pull lists those files and asks first (--yes skips
     the question).
     """
@@ -322,7 +342,7 @@ def pull(paths: tuple[str, ...], yes: bool, dry_run: bool, verbose: bool):
     except (ValueError, GitError, RenderError) as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    if print_results(results, verbose=verbose or bool(paths), pending=dry_run):
+    if print_results(results, verbose=verbose, pending=dry_run, named=bool(paths)):
         sys.exit(1)
 
 
@@ -339,8 +359,8 @@ def status(paths: tuple[str, ...], show_diff: bool, no_fetch: bool, exit_code: b
     """Show what `sync` would do for each file, without changing anything.
 
     Changes waiting on GitHub are fetched and included (--no-fetch skips
-    that). PATHS limits it to those tracked files or directories (quoted
-    globs are matched against tracked paths). --diff also shows how each
+    that). PATHS limits it to those tracked files or directories, or files
+    inside a tracked directory (quoted globs are matched against tracked paths). --diff also shows how each
     differing file differs: `-` lines are the repo's version, `+` lines this
     machine's.
     """
@@ -394,7 +414,8 @@ def add(paths: tuple[str, ...], remote: str | None, allow_private: bool, dry_run
     ~/.config/foo is stored as files/.config/foo (paths outside ~ need
     --remote). If --remote ends with /, is an existing directory, or several
     paths are given, each path's name is kept inside it. Directories are copied verbatim
-    (no .j2 rendering).
+    (no .j2 rendering), and each file in them is synced on its own. A path
+    excluded from a tracked directory is included again.
 
     Symlinks are never copied: PATHS themselves can't be symlinks, and
     symlinks inside a directory (plus nested .git directories) are skipped
@@ -416,10 +437,7 @@ def add(paths: tuple[str, ...], remote: str | None, allow_private: bool, dry_run
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
     print_results(results, verbose=True, pending=dry_run)
-    for r in results:
-        if not r.error:
-            dest = str(r.dest).replace(str(Path.home()), "~")
-            click.echo(f"  Tracking {dest} as {click.style(r.source, fg='cyan')}")
+    print_tracked(syncer.tracked, "Tracking {dest} as {source}")
     if allow_private:
         private = [r.dest for r in results if not r.error and find_private(r.dest) is not None]
         for dest in private:
@@ -477,10 +495,7 @@ def checkout(remotes: tuple[str, ...], local: Path | None, force: bool, dry_run:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
     print_results(results, verbose=True, pending=dry_run)
-    for r in results:
-        if not r.error and not r.skipped:
-            dest = str(r.dest).replace(str(Path.home()), "~")
-            click.echo(f"  Tracking {click.style(r.source, fg='cyan')} as {dest}")
+    print_tracked(syncer.tracked, "Tracking {source} as {dest}")
     if any(r.error for r in results):
         sys.exit(1)
 
@@ -495,8 +510,10 @@ def remove(paths: tuple[str, ...], dry_run: bool):
     """Stop tracking PATHS (files or directories).
 
     Removes their manifest entries and their copies in the repo, in one
-    commit. The files on disk are left untouched, and may already be
-    deleted. Quoted globs are matched against tracked paths.
+    commit. A file or subdirectory inside a tracked directory is added to
+    the directory's exclude list instead. The files on disk are left
+    untouched, and may already be deleted. Quoted globs are matched against
+    tracked paths.
     """
     cfg = load_config_or_exit()
     syncer = Syncer(cfg, dry_run=dry_run)
@@ -507,8 +524,9 @@ def remove(paths: tuple[str, ...], dry_run: bool):
         sys.exit(1)
     print_results(results, verbose=True, pending=dry_run)
     verb = "Would stop tracking" if dry_run else "No longer tracking"
-    for r in results:
-        click.echo(f"  {verb} {click.style(r.source, fg='cyan')} (disk copy kept)")
+    for source, excluded_from in syncer.untracked:
+        where = f"excluded from {home_relative(excluded_from)}; " if excluded_from else ""
+        click.echo(f"  {verb} {click.style(source, fg='cyan')} ({where}disk copy kept)")
 
 
 # ── var ────────────────────────────────────────────────────────────────────────

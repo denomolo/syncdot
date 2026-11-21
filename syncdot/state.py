@@ -82,12 +82,37 @@ class State:
     def forget(self, dest: Path) -> None:
         self.files.pop(str(dest), None)
 
+    def forget_tree(self, dest: Path) -> None:
+        """Forget `dest` and every file recorded inside it."""
+        self.forget(dest)
+        for rel in self.paths_under(dest):
+            self.forget(dest / rel)
+
+    def paths_under(self, dest: Path) -> list[str]:
+        """Relative paths of the files recorded inside directory `dest`."""
+        prefix = str(dest) + "/"
+        return [k[len(prefix):] for k in self.files if k.startswith(prefix)]
+
+    def mark_dir(self, dest: Path) -> None:
+        """Record that directory `dest` was synced here as a whole."""
+        self.record_hash(dest, DIR_SYNCED)
+
+    def dir_synced(self, dest: Path) -> bool:
+        entry = self.get(dest)
+        return entry is not None and entry.last_applied_hash == DIR_SYNCED
+
     def record_hash(self, dest: Path, digest: str) -> None:
         self.files[str(dest)] = FileState(
             last_applied_hash=digest,
             last_applied_at=datetime.now(timezone.utc).isoformat(),
         )
 
+
+# State of a tracked directory itself, once it was pulled, pushed, added or
+# checked out as a whole: files that later appear in it on either side are
+# synced too. Each file inside has its own state. (Up to 1.0, the directory's
+# state was one hash of all its files; see Syncer._migrate_dir_state.)
+DIR_SYNCED = "directory"
 
 # ── Hashing ────────────────────────────────────────────────────────────────────
 
@@ -151,9 +176,3 @@ def sha256_dir(path: Path, include_binary: bool = False) -> Optional[str]:
         h.update(child.read_bytes())
     return h.hexdigest()
 
-
-def hash_path(path: Path, include_binary: bool = False) -> Optional[str]:
-    """Hash a file or directory."""
-    if path.is_dir():
-        return sha256_dir(path, include_binary)
-    return sha256_file(path)

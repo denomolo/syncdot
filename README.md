@@ -115,7 +115,7 @@ the repo later: `sync` reports them until you `pull` them.
 | `syncdot pull [PATH...] [--yes]` | Copy the repo's version to this machine, for every file or just `PATH`s; asks before overwriting local changes. |
 | `syncdot add PATH... [--remote R] [--allow-private]` | Start tracking files or directories from disk. |
 | `syncdot checkout REMOTE... [--local L] [--force]` | Start tracking files that are already in the repo, writing them to disk. |
-| `syncdot remove PATH...` | Stop tracking files or directories. The copies on disk are kept. |
+| `syncdot remove PATH...` | Stop tracking files or directories, or exclude files from a tracked directory. The copies on disk are kept. |
 | `syncdot var list \| set NAME=VALUE... \| unset NAME...` | Manage [template variables](#variables). |
 | `syncdot env list \| set NAME=VALUE... \| unset NAME... \| hook` | Manage [environment variables](#environment-variables) for your session. |
 | `syncdot profile list \| set NAME \| new NAME` | Manage [profiles](#profiles). |
@@ -163,6 +163,9 @@ syncdot add /etc/hosts --remote system/      # outside ~ needs --remote
   already tracked, binary, private, a symlink, or two paths that would land
   on the same repo path) are reported, the rest are still added, and the
   command exits with status 1.
+- A directory is one manifest entry, but every file in it is synced,
+  listed and selected on its own (see [Tracked directories](#tracked-directories)).
+  Adding a path that's excluded from a tracked directory includes it again.
 - Private files are refused: a file only you can access (no group or other
   permissions, e.g. mode `600`), a directory like that (e.g. `~/.ssh` at
   `700`), or a directory containing such a file. They usually hold secrets,
@@ -196,8 +199,7 @@ syncdot status ~/.config/kitty --diff
 
 `--diff` prints a unified diff for each file that differs, from the repo's
 version (rendered, for templates) to this machine's: `-` lines are only in
-the repo, `+` lines only here. Directories are compared file by file, and
-binary files are only reported as different.
+the repo, `+` lines only here. Binary files are only reported as different.
 
 `status` fetches from GitHub first, so it includes changes that `sync`
 would pull (previewed in a temporary copy, like `--dry-run`; nothing is
@@ -212,11 +214,30 @@ syncdot push ~/.config/starship.toml
 syncdot pull '~/.config/foo/*'      # also restores files deleted from disk
 ```
 
-Without paths they act on every tracked file. Paths are files or
-directories on disk as listed in the manifest; quoted globs are matched
-against tracked paths rather than the filesystem. A file *inside* a tracked
-directory is rejected — use the directory. `remove` takes paths the same
-way.
+Without paths they act on every tracked file. Paths are tracked files or
+directories on disk, or files and subdirectories inside a tracked
+directory; quoted globs are matched against tracked paths, files inside
+tracked directories included, rather than the filesystem. `status` and
+`remove` take paths the same way.
+
+### Tracked directories
+
+`add ~/.config/kitty` gives the directory one entry in the manifest, but
+each file inside it is synced on its own, with its own state:
+
+- `status`, `sync`, `push` and `pull` list every file in it, and changes to
+  different files on different machines never conflict: only a file changed
+  on both sides is a conflict.
+- `push`, `pull` and `status` accept a file or subdirectory inside it,
+  e.g. `syncdot pull ~/.config/kitty/kitty.conf`.
+- A file created in the directory on one side is added on the other, and a
+  file deleted on one side is deleted on the other (shown as `[deleted]`).
+  On a machine where the directory was never synced, its files are left
+  alone until you `pull` or `push` the whole directory; pulling one file
+  inside it only sets up that file.
+- `remove ~/.config/kitty/themes` stops tracking a file or subdirectory: it
+  is added to the entry's `exclude:` list and deleted from the repo, and
+  the copy on disk is kept. `add` it again to include it again.
 
 `pull` never silently loses local work: if a file has changes that aren't
 in the repo (edited since it was last synced, or a local file that was
@@ -273,6 +294,8 @@ files:
 
   - source: files/.config/kitty
     dest: ~/.config/kitty
+    exclude:              # optional, for directories: paths inside it to leave out
+      - themes
 ```
 
 See [`manifest.yaml.example`](manifest.yaml.example) and
@@ -426,6 +449,12 @@ isn't a conflict: `sync` leaves it alone until you `pull` or `push` it.)
 | `newer-wins` | The newer side wins: the file's modification time on disk vs the time of the last commit that changed it in the repo. |
 | `repo-wins` | The repo's version wins and overwrites the local file. |
 
+Inside a tracked directory, a file deleted on one side and changed on the
+other is a conflict too: `local-wins` deletes it from the repo or restores
+it there, `repo-wins` restores or deletes it here, and `newer-wins` keeps a
+file deleted here (its deletion time isn't known) but compares a deletion
+in the repo by its commit time.
+
 `local-wins` is the default because it never loses anything: the repo's
 version it replaces stays in git history, while a local file that gets
 overwritten is gone.
@@ -456,6 +485,8 @@ state_path: ~/.local/state/syncdot/state.json
   they are left untouched on both sides.
 - **Nested `.git` directories** inside a tracked directory are ignored, so
   they don't turn into submodules.
+- **Excluded paths**: files and subdirectories in a directory entry's
+  `exclude:` list (`syncdot remove` puts them there).
 - **Private files** (e.g. mode `600`) are refused by `add` unless you pass
   `--allow-private`.
 - **Permissions**, apart from the executable bit: git records only whether
