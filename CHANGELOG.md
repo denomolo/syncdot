@@ -5,7 +5,7 @@ All notable changes to syncdot (called dotsync up to 0.8.0) are documented here.
 only come with a new major version. (On 0.x, minor releases could include
 breaking changes.)
 
-## [Unreleased]
+## [1.1.0] - 2026-11-21
 
 ### Changed
 - Files inside a tracked directory are synced one by one instead of the
@@ -14,11 +14,18 @@ breaking changes.)
   directory on different machines no longer conflict (with local-wins, the
   other machine's change used to be pushed over). The manifest still has one
   entry per directory, and state from 1.0 is converted on the first run.
+- Directories with more than 5 files are summarized in the output: errors,
+  conflicts and overwritten local changes are always listed, other changes
+  show the first 5 of each kind and a count of the rest, files in sync are
+  counted, and a directory whose files all did the same is one line. `-v`
+  lists every file; `status`, `add`, `checkout` and `remove` accept it now
+  too.
 - `add` and `checkout` print one "Tracking" line per directory, with its
-  number of files. `push PATH` and `pull PATH` only list unchanged files
-  inside directories with `-v`.
+  number of files.
 
 ### Added
+- Each GitHub release has the wheel and source archive attached, for
+  installing without PyPI.
 - `status`, `push` and `pull` accept files and subdirectories inside a
   tracked directory, and their globs match files inside directories.
 - `remove` of a file or subdirectory inside a tracked directory excludes it:
