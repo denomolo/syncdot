@@ -128,7 +128,8 @@ changing anything: incoming changes from GitHub are fetched and previewed
 (including merging `base` into a profile) in a temporary copy, so your
 files, the local clone's branches and its working tree stay exactly as
 they were. `sync`, `push` and `pull` accept `-v` to list unchanged files
-too.
+too, and every command that lists files accepts `-v` to list each file
+inside a tracked directory (see below).
 
 Only one syncdot runs at a time. If you start a command while another one
 is running (for example the background `sync`), it waits for it to
@@ -225,9 +226,15 @@ tracked directories included, rather than the filesystem. `status` and
 `add ~/.config/kitty` gives the directory one entry in the manifest, but
 each file inside it is synced on its own, with its own state:
 
-- `status`, `sync`, `push` and `pull` list every file in it, and changes to
-  different files on different machines never conflict: only a file changed
-  on both sides is a conflict.
+- `status`, `sync`, `push` and `pull` report every file in it, and changes
+  to different files on different machines never conflict: only a file
+  changed on both sides is a conflict.
+- To keep large directories readable, a directory with more than 5 files is
+  summarized: conflicts, errors and overwritten local changes are always
+  listed, other changes show the first 5 of each kind plus a count of the
+  rest, files in sync are one count line (`·  ~/.vim  (518 files in sync)`),
+  and a directory whose files all did the same is one line
+  (`↑  ~/.vim  (523 files)`). `-v` lists every file.
 - `push`, `pull` and `status` accept a file or subdirectory inside it,
   e.g. `syncdot pull ~/.config/kitty/kitty.conf`.
 - A file created in the directory on one side is added on the other, and a

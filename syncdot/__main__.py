@@ -22,6 +22,7 @@ Usage:
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import glob
 import shutil
@@ -57,29 +58,106 @@ ACTION_SYMBOLS = {
 }
 
 
-def print_results(results, verbose: bool = False, pending: bool = False, named: bool = False) -> int:
-    """Print per-file results and a summary (pending=True words it as not yet
-    done). Unchanged files are listed with verbose, and with named (the user
-    gave paths) except files inside tracked directories. Returns the number
-    of errors."""
-    errors = 0
+# Lines of one kind shown per tracked directory before the rest are counted
+DIR_LINES = 5
+
+
+def result_line(r) -> str:
+    sym = ACTION_SYMBOLS[r.action]
+    line = f"  {sym}  {home_relative(r.dest)}"
+    if r.skipped:
+        sym = click.style("-", fg="bright_black")
+        line = f"  {sym}  {home_relative(r.dest)}" + click.style(f"  [skipped: {r.skipped}]", fg="bright_black")
+    if r.deleted and not r.skipped:
+        line += click.style("  [deleted]", fg="red")
+    if r.resolved_by:
+        line += click.style(f"  [{r.resolved_by}]", fg="yellow")
+    if r.error:
+        line += click.style(f"  ERROR: {r.error}", fg="red")
+    return line
+
+
+def directory_lines(dest: Path, group, unchanged: bool, pending: bool) -> list[str]:
+    """
+    Lines for the results of files inside one tracked directory: errors,
+    conflicts and overwritten local changes in full; otherwise the first
+    DIR_LINES of each kind and a count of the rest, unchanged files as a
+    count, and one line for the directory when every file is the same kind.
+    Directories with at most DIR_LINES results are listed in full.
+    """
+    if len(group) <= DIR_LINES:
+        return [result_line(r) for r in group
+                if unchanged or r.action != Action.NOTHING or r.error or r.skipped]
+
+    def kind(r):
+        return ("skipped", r.skipped) if r.skipped else (r.action, r.deleted)
+    always = [r for r in group if r.error or r.action == Action.CONFLICT or r.resolved_by]
+    rest = [r for r in group if r not in always]
+    shown_dir = home_relative(dest)
+    kinds = list(dict.fromkeys(kind(r) for r in rest))
+
+    if not always and len(kinds) == 1 and len(rest) > DIR_LINES:
+        r, n = rest[0], len(rest)
+        if r.action == Action.NOTHING and not r.skipped:
+            if not unchanged:
+                return []
+            return [f"  {ACTION_SYMBOLS[r.action]}  {shown_dir}  ({n} files in sync)"]
+        line = result_line(dataclasses.replace(r, dest=dest))
+        return [f"{line}  ({n} files)"]
+
+    lines = []
+    shown = set(map(id, always))
+    hidden: dict[tuple, int] = {}
+    for k in kinds:
+        of_kind = [r for r in rest if kind(r) == k]
+        if k == (Action.NOTHING, False):
+            continue
+        shown.update(map(id, of_kind[:DIR_LINES]))
+        if len(of_kind) > DIR_LINES:
+            hidden[k] = len(of_kind) - DIR_LINES
+    lines += [result_line(r) for r in group if id(r) in shown]
+    verbs = {Action.PULL: ("to pull", "pulled"), Action.PUSH: ("to push", "pushed"),
+             Action.UNTRACK: ("to untrack", "untracked")}
+    for k, n in hidden.items():
+        what = "skipped" if k[0] == "skipped" else verbs.get(k[0], ("", ""))[0 if pending else 1]
+        lines.append(click.style(f"     … and {n} more {what} in {shown_dir}  (-v shows all)",
+                                 fg="bright_black"))
+    in_sync = sum(1 for r in rest if kind(r) == (Action.NOTHING, False))
+    if unchanged and in_sync:
+        label = "file" if in_sync == 1 else "files"
+        lines.append(f"  {ACTION_SYMBOLS[Action.NOTHING]}  {shown_dir}  "
+                     f"({in_sync} {'more ' if lines else ''}{label} in sync)")
+    return lines
+
+
+def print_results(results, verbose: bool = False, pending: bool = False, named: bool = False,
+                  unchanged: bool = False) -> int:
+    """
+    Print per-file results and a summary (pending=True words it as not yet
+    done). Returns the number of errors.
+
+    Unchanged files are listed with `unchanged`, and with `named` (the user
+    gave paths) except files inside tracked directories. Files inside a
+    tracked directory are capped, see directory_lines; `verbose` lists
+    every file, unchanged ones included.
+    """
+    errors = sum(1 for r in results if r.error)
+    groups: dict[str, list] = {}
     for r in results:
-        sym = ACTION_SYMBOLS[r.action]
-        dest = str(r.dest).replace(str(Path.home()), "~")
-        line = f"  {sym}  {dest}"
-        if r.skipped:
-            sym = click.style("-", fg="bright_black")
-            line = f"  {sym}  {dest}" + click.style(f"  [skipped: {r.skipped}]", fg="bright_black")
-        if r.deleted and not r.skipped:
-            line += click.style("  [deleted]", fg="red")
-        if r.resolved_by:
-            line += click.style(f"  [{r.resolved_by}]", fg="yellow")
-        if r.error:
-            line += click.style(f"  ERROR: {r.error}", fg="red")
-            errors += 1
-        if (verbose or named and r.entry is None or r.action != Action.NOTHING
+        if r.entry is not None:
+            groups.setdefault(r.entry["dest"], []).append(r)
+    printed = set()
+    for r in results:
+        if r.entry is not None and not verbose:
+            if r.entry["dest"] not in printed:
+                printed.add(r.entry["dest"])
+                for line in directory_lines(Path(r.entry["dest"]), groups[r.entry["dest"]],
+                                            unchanged, pending):
+                    click.echo(line)
+            continue
+        if (verbose or unchanged or named and r.entry is None or r.action != Action.NOTHING
                 or r.error or r.skipped):
-            click.echo(line)
+            click.echo(result_line(r))
 
     counts = {a: sum(1 for r in results if r.action == a and not r.skipped and not r.error) for a in Action}
     skipped = sum(1 for r in results if r.skipped)
@@ -354,8 +432,9 @@ def pull(paths: tuple[str, ...], yes: bool, dry_run: bool, verbose: bool):
 @click.option("--no-fetch", is_flag=True, help="Don't check the remote; compare with the local clone only.")
 @click.option("--exit-code", is_flag=True,
               help=f"Exit with {EXIT_PENDING} if anything isn't in sync (0 if all is).")
+@click.option("-v", "--verbose", is_flag=True, help="List every file, including all files inside directories.")
 @locked
-def status(paths: tuple[str, ...], show_diff: bool, no_fetch: bool, exit_code: bool):
+def status(paths: tuple[str, ...], show_diff: bool, no_fetch: bool, exit_code: bool, verbose: bool):
     """Show what `sync` would do for each file, without changing anything.
 
     Changes waiting on GitHub are fetched and included (--no-fetch skips
@@ -372,7 +451,7 @@ def status(paths: tuple[str, ...], show_diff: bool, no_fetch: bool, exit_code: b
     except ValueError as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    print_results(results, verbose=True, pending=True)
+    print_results(results, verbose=verbose, pending=True, unchanged=True)
     for r in results:
         if r.diff:
             print_diff(r.diff)
@@ -401,8 +480,9 @@ def print_diff(lines: list[str]) -> None:
 @click.option("--allow-private", is_flag=True,
               help="Track files only you can read (e.g. mode 600), which often hold secrets.")
 @click.option("--dry-run", is_flag=True, help="Show what would happen without making changes.")
+@click.option("-v", "--verbose", is_flag=True, help="List every file, including all files inside directories.")
 @locked
-def add(paths: tuple[str, ...], remote: str | None, allow_private: bool, dry_run: bool):
+def add(paths: tuple[str, ...], remote: str | None, allow_private: bool, dry_run: bool, verbose: bool):
     """Start tracking PATHS (files or directories), stored under files/ in the repo.
 
     Several paths can be given at once, and glob patterns are expanded
@@ -436,7 +516,7 @@ def add(paths: tuple[str, ...], remote: str | None, allow_private: bool, dry_run
     except (ValueError, GitError) as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    print_results(results, verbose=True, pending=dry_run)
+    print_results(results, verbose=verbose, pending=dry_run, unchanged=True)
     print_tracked(syncer.tracked, "Tracking {dest} as {source}")
     if allow_private:
         private = [r.dest for r in results if not r.error and find_private(r.dest) is not None]
@@ -473,8 +553,9 @@ def expand_paths(patterns: tuple[str, ...]) -> list[Path]:
 @click.option("--local", type=click.Path(path_type=Path), help="Where to write it on disk.")
 @click.option("--force", is_flag=True, help="Overwrite existing local files that differ.")
 @click.option("--dry-run", is_flag=True, help="Show what would happen without making changes.")
+@click.option("-v", "--verbose", is_flag=True, help="List every file, including all files inside directories.")
 @locked
-def checkout(remotes: tuple[str, ...], local: Path | None, force: bool, dry_run: bool):
+def checkout(remotes: tuple[str, ...], local: Path | None, force: bool, dry_run: bool, verbose: bool):
     """Start tracking REMOTES that are already in the repo (the reverse of add).
 
     REMOTES are paths or glob patterns relative to files/ (quote globs
@@ -494,7 +575,7 @@ def checkout(remotes: tuple[str, ...], local: Path | None, force: bool, dry_run:
     except (ValueError, GitError, RenderError) as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    print_results(results, verbose=True, pending=dry_run)
+    print_results(results, verbose=verbose, pending=dry_run, unchanged=True)
     print_tracked(syncer.tracked, "Tracking {source} as {dest}")
     if any(r.error for r in results):
         sys.exit(1)
@@ -505,8 +586,9 @@ def checkout(remotes: tuple[str, ...], local: Path | None, force: bool, dry_run:
 @cli.command()
 @click.argument("paths", nargs=-1, required=True)
 @click.option("--dry-run", is_flag=True, help="Show what would happen without making changes.")
+@click.option("-v", "--verbose", is_flag=True, help="List every file, including all files inside directories.")
 @locked
-def remove(paths: tuple[str, ...], dry_run: bool):
+def remove(paths: tuple[str, ...], dry_run: bool, verbose: bool):
     """Stop tracking PATHS (files or directories).
 
     Removes their manifest entries and their copies in the repo, in one
@@ -522,7 +604,7 @@ def remove(paths: tuple[str, ...], dry_run: bool):
     except (ValueError, GitError) as e:
         click.echo(click.style(str(e), fg="red"), err=True)
         sys.exit(1)
-    print_results(results, verbose=True, pending=dry_run)
+    print_results(results, verbose=verbose, pending=dry_run, unchanged=True)
     verb = "Would stop tracking" if dry_run else "No longer tracking"
     for source, excluded_from in syncer.untracked:
         where = f"excluded from {home_relative(excluded_from)}; " if excluded_from else ""

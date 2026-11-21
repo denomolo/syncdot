@@ -281,3 +281,71 @@ def test_deleted_here_but_changed_in_the_repo_is_a_conflict(sandbox):
 
     assert "!  ~/.config/kitty/kitty.conf" in out and "newer-wins → repo" in out
     assert a.read_text() == "font_size 10\n"                 # the content is kept
+
+
+def big_dir(sandbox, n=12):
+    files = [sandbox.file(f".vim/plugin/p{i:02}.vim", f"{i}\n") for i in range(n)]
+    sandbox.run("add", "~/.vim")
+    return files
+
+
+def test_a_directory_whose_files_all_did_the_same_is_one_line(sandbox):
+    files = [sandbox.file(f".vim/plugin/p{i:02}.vim", f"{i}\n") for i in range(12)]
+
+    out = sandbox.run("add", "~/.vim").output
+    assert "↑  ~/.vim  (12 files)" in out and "p00.vim" not in out
+    assert "↑ 12 pushed" in out and "Tracking ~/.vim as files/.vim (12 files)" in out
+
+    out = sandbox.run("status").output
+    assert "·  ~/.vim  (12 files in sync)" in out and "p00.vim" not in out
+
+    assert "p00.vim" in sandbox.run("status", "-v").output
+
+    for i in range(12):
+        sandbox.file(f".nvim/p{i:02}.lua", f"{i}\n")
+    out = sandbox.run("add", "~/.nvim", "-v").output
+    assert all(f"↑  ~/.nvim/p{i:02}.lua" in out for i in range(12))
+
+
+def test_mixed_directory_shows_five_of_each_kind_and_counts_the_rest(sandbox):
+    files = big_dir(sandbox)
+    for f in files[:8]:
+        f.write_text("changed\n")
+
+    out = sandbox.run("status").output
+
+    shown = [f"p{i:02}.vim" for i in range(5)]
+    assert all(s in out for s in shown) and "p05.vim" not in out
+    assert "… and 3 more to push in ~/.vim  (-v shows all)" in out
+    assert "·  ~/.vim  (4 more files in sync)" in out
+    assert "↑ 8 to push" in out
+
+    out = sandbox.run("status", "-v").output
+    assert all(f"p{i:02}.vim" in out for i in range(12)) and "more" not in out
+
+
+def test_conflicts_and_errors_in_a_directory_are_never_hidden(sandbox):
+    files = big_dir(sandbox)
+    other = sandbox.other_machine()
+    for i in range(8):
+        other.write(f"files/.vim/plugin/p{i:02}.vim", "theirs\n")
+    other.commit_and_push()
+    for f in files[:8]:
+        f.write_text("mine\n")
+
+    out = sandbox.run("sync").output
+
+    assert sum(f"!  ~/.vim/plugin/p{i:02}.vim" in out for i in range(8)) == 8
+    assert "! 8 conflicts" in out
+
+
+def test_new_machine_shows_an_unsynced_directory_as_one_line(sandbox):
+    files = big_dir(sandbox)
+    for f in files:
+        f.unlink()
+    (sandbox.root / "state" / "state.json").unlink()
+
+    out = sandbox.run("sync").output
+
+    assert "-  ~/.vim  [skipped: not synced on this machine yet]  (12 files)" in out
+    assert "p00.vim" not in out
