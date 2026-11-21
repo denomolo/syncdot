@@ -2,7 +2,8 @@ name: publish
 
 # Publishes to PyPI when a full (not pre-release) GitHub release is published,
 # using PyPI Trusted Publishing: PyPI trusts this workflow directly, so no API
-# token is stored. 0.x pre-releases stay GitHub-only.
+# token is stored, and attaches the same wheel and sdist to the GitHub
+# release. 0.x pre-releases stay GitHub-only.
 on:
   release:
     types: [published]
@@ -44,3 +45,18 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # lets the job upload files to the release
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - name: Attach the wheel and sdist to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/* --clobber --repo "${{ github.repository }}"

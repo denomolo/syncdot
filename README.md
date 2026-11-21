@@ -37,9 +37,13 @@ pipx install syncdot
 syncdot --version
 ```
 
-`pipx upgrade syncdot` upgrades it later. To install straight from GitHub
-instead: `pipx install git+https://github.com/denomolo/syncdot.git`, or
-from a local checkout: `pipx install --force .`
+`pipx upgrade syncdot` upgrades it later. Without PyPI, every
+[GitHub release](https://github.com/denomolo/syncdot/releases) has the
+wheel and source archive attached:
+`pipx install https://github.com/denomolo/syncdot/releases/download/v1.1.0/syncdot-1.1.0-py3-none-any.whl`.
+To install straight from the repo instead:
+`pipx install git+https://github.com/denomolo/syncdot.git`, or from a local
+checkout: `pipx install --force .`
 
 **Coming from dotsync?** syncdot was called dotsync up to 0.8.0. Install
 syncdot, run any `syncdot` command, and your config, clone and state move
@@ -518,9 +522,7 @@ pull request (`.github/workflows/tests.yml`).
 
 ## Changelog
 
-See [CHANGELOG.md](CHANGELOG.md). syncdot is pre-1.0: minor releases may
-include breaking changes, which are always called out there.
-
+See [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 Copyright (c) 2026 Ariel Shatil. syncdot is released under the
